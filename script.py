@@ -1,62 +1,163 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # This script retrieves the structures in complex with the molecules from parquet.How to find the files?
-# 
-# #### molecule file (Drug) : [http://ftp.ebi.ac.uk/pub/databases/opentargets/platform/21.11/output/etl/parquet/molecule/*]()
-# #### unichem file : [https://ftp.ebi.ac.uk/pub/databases/chembl/UniChem/data/wholeSourceMapping/src_id1/src1src3.txt.gz]()
-# #### ensembl file : [https://ftp.ebi.ac.uk/pub/databases/msd/sifts/csv/pdb_chain_ensembl.csv]()
-
-# In[41]:
-
-
 import requests
-import timeit
 import pyspark.sql.functions as f
 from pyspark.sql import SparkSession
 import argparse
+from json import JSONDecodeError
+import logging
+import sys
 
 
-# In[42]:
+def main():
 
+    logging.info('Program begin.')
 
-program_description = '''
-This script retrieves the structures in complex with the molecules from parquet.
-How to find the files?
-molecule file here (Drug): http://ftp.ebi.ac.uk/pub/databases/opentargets/platform/21.11/output/etl/parquet/molecule/*
-unichem file : https://ftp.ebi.ac.uk/pub/databases/chembl/UniChem/data/wholeSourceMapping/src_id1/src1src3.txt.gz
-ensembl file : https://ftp.ebi.ac.uk/pub/databases/msd/sifts/csv/pdb_chain_ensembl.csv
-'''
+    spark = SparkSession.builder.getOrCreate()
 
-parser = argparse.ArgumentParser(add_help=True, description=program_description)
+    # ----- GET MOLECULE ID -----
+    # Molecule DataFrame
+    molecule_df = (
+        spark.read
+        .parquet(args.parquet)
+        .select(
+            f.col('inchiKey').alias('inchikey'),
+            f.col('id').alias('chemblId'),
+            'name', 'linkedTargets', 'linkedDiseases'
+        )
+    )
 
-parser.add_argument('-p', '--parquet', help='Path to parquet folder', default=None, metavar='parquet_file_path', type=str, required=True)
-parser.add_argument('-u', '--unichem', help='Path to unichem src1src3.txt file', default=None, metavar='unichem_file_path', type=str, required=True)
-parser.add_argument('-e', '--ensembl', help='Path to pdb_chain_ensembl.csv file', default=None, metavar='ensembl_file_path', type=str, required=True)
+    logging.info(f'RESULT: Number of molecules in parquet files (ChemblId): {molecule_df.count()}')
 
-args = parser.parse_args()
+    # ----- GET PDB ID -----
+    inchikey_df = (
+        spark.read
+        .csv(
+            args.inchikey,
+            sep=',',
+            header=True,
+            comment='#'
+        )
+        .select(
+            f.col('InChIKey').alias('inchikey'),
+            f.col('CCD_ID').alias('pdbCompoundId')
+        )
+    )
 
+    logging.info(f'RESULT: Number of molecules in Inchikey (inchikeyId): {inchikey_df.count()}')
 
-# In[43]:
+    # Join Unichem and Molecule DataFrame
+    inchikey_molecule_joined_df = (
+        molecule_df
+        .join(inchikey_df, on='inchikey')
+    )
 
+    logging.info('START: Get pdbStructureId on pdbe API.')
 
-molecule_path = '/Users/marinegirardey/Documents/OpenTargetInternship/molecule/'
-# molecule = '/Users/marinegirardey/Documents/OpenTargetInternship/small_folder/'
-unichem_path = '/Users/marinegirardey/Documents/OpenTargetInternship/id_files/src1src3.txt'
-ensembl_path = '/Users/marinegirardey/Documents/OpenTargetInternship/chain_ensembl_struct_mol_joined.csv'
+    # ----- GET STRUCTURE ID -----
+    # Apply get_structure function on the Unichem-Molecule DataFrame
+    inchikey_molecule_structure_joined_pd_df = (
+        inchikey_molecule_joined_df
+        .toPandas()
+        .assign(pdbStructureId=lambda df: df.pdbCompoundId.apply(get_structure))
+    )
 
-dropped_molecules = [
-    'CHEMBL692', 'CHEMBL1236970', 'CHEMBL457299', 'CHEMBL113178'
-]
+    logging.info('FINISHED: Get pdbStructureId on pdbe API.')
 
+    inchikey_molecule_structure_joined_pd_df.to_csv('output_files/structure_of_molecules.csv', index=False, header=True)
 
-# In[ ]:
+    # Convert Spark DataFrame into Pandas DataFrame
+    inchikey_molecule_structure_joined_spark_df = spark.createDataFrame(inchikey_molecule_structure_joined_pd_df)
 
+    # ----- STATISTICS -----
+    total_nb_struct_df = (
+        inchikey_molecule_structure_joined_spark_df
+        .withColumn('pdbStructureId', f.explode('pdbStructureId'))
+        .select('pdbStructureId')
+        .distinct()
+    )
 
-spark = SparkSession.builder.getOrCreate()
+    nb_molecule_without_struct_df = (
+        inchikey_molecule_structure_joined_spark_df
+        .filter(f.size('pdbStructureId') == 0)
+        .distinct()
+    )
 
+    logging.info(f'RESULT: Number of structures (pdbId): {total_nb_struct_df.count()}')
+    logging.info(f'RESULT: Number of molecule without structure: {nb_molecule_without_struct_df.count()}')
 
-# In[ ]:
+    # Count number of structure per molecule
+    inchikey_molecule_structure_joined_spark_df = (
+        inchikey_molecule_structure_joined_spark_df
+        .withColumn(
+            "nbPdbStructure",
+            f.size(f.col("pdbStructureId"))
+        )
+        .orderBy(f.desc("nbPdbStructure"))
+    )
+
+    # Save into a CSV
+    inchikey_molecule_structure_joined_spark_df.toPandas().to_csv("output_files/molecule_structure_target.csv", index=False, header=True)
+
+    # ----- GET TARGET ID -----
+    pdb_target_df = (
+            spark.read.csv(args.ensembl, sep=',', header=True, comment='#')
+            .select(
+                f.col('PDB').alias('pdbStructureId'),
+                f.col('GENE_ID').alias('geneId')
+            )
+            .groupby("pdbStructureId")
+            .agg(
+                f.collect_set(f.col("geneId")).alias("geneIds")
+            )
+            .distinct()
+            .persist()
+    )
+
+    nb_target_pd_df = (
+        pdb_target_df
+        .withColumn('geneIdsExploded', f.explode('geneIds'))
+    )
+
+    nb_human_target_df = (
+        pdb_target_df
+        .withColumn('geneIdsExploded', f.explode('geneIds'))
+        .filter(f.col('geneIdsExploded').startswith('ENSG'))
+    )
+
+    logging.info(f'RESULT: Number of targets (ensemblId): {nb_target_pd_df.count()}')
+    logging.info(f'RESULT: Number of human targets: {nb_human_target_df.count()}')
+    logging.info(f'RESULT: Number of non-human targets: {nb_target_pd_df.count() - nb_human_target_df.count()}')
+
+    inchikey_molecule_structure_target_joined_spark_df = (
+        inchikey_molecule_structure_joined_spark_df
+        .select("chemblId", "pdbCompoundId", f.explode("pdbStructureId").alias("pdbStructureId"))
+        .join(pdb_target_df, on="pdbStructureId", how="inner") # Only keep the structures mapped by ensembl (inner)
+    )
+
+    df = (
+        inchikey_molecule_structure_target_joined_spark_df
+        .groupBy(f.col('chemblId'), f.col('geneIds'))
+        .agg(
+            f.first(f.col('pdbStructureId')),
+            f.first(f.col('pdbCompoundId'))
+        )
+    )
+
+    df2 = (
+        df
+        .groupBy(f.col('chemblId'))
+        .agg(f.collect_set('first(pdbStructureId)'))
+    )
+
+    # Count number of structure per molecule
+    df3 = (df2
+           .withColumn("nbPdbStructureAfterFilter", f.size(f.col("collect_set(first(pdbStructureId))")))
+           .orderBy(f.desc("nbPdbStructureAfterFilter"))
+           )
+
+    logging.info('Program finished.')
 
 
 def get_structure(pdb_compound_id: str) -> list:
@@ -72,249 +173,97 @@ def get_structure(pdb_compound_id: str) -> list:
     try:
         data = response.json()
         return data[pdb_compound_id]
-    except:
+
+    except JSONDecodeError:
+        print(f'Failed to return structures to: {pdb_compound_id}')
         if len(response.json()) == 0:
             return []
 
+    except KeyError:
+        print(f'Empty data was returned for: {pdb_compound_id}')
+        return []
 
-# In[ ]:
 
-
-def create_pdb_target_gene_df(path_id_file: str, unichem_molecule_struct_spark_df):
+def create_pdb_target_gene_df(path_id_file: str, unichem_molecule_struct_df):
     """Updating DataFrame with target identifiers from sift msd as 'chain_ensembl_struct_mol_joined.csv'
 
     Args:
         path_id_file: string, a path to the csv file
-        unichem_molecule_struct_spark_df: dataframe, containing unichem molecule id, pdb compound id, pdbkb structure id
+        unichem_molecule_struct_df: dataframe, containing unichem molecule id, pdb compound id, pdbkb structure id
     Returns:
         Same DataFrame than unichem_molecule_struct_spark_df but with the target gene id column in extra
     """
     pdb_chain_ensembl = (
         spark.read.csv(path_id_file, sep=',', header=True, comment='#')
-            .select('PDB', 'GENE_ID').distinct()
+        .select(
+            f.col('PDB').alias('pdbStructureId'),
+            f.col('CHAIN').alias('chain'),
+            f.col('GENE_ID').alias('geneId')
+        )
+        .distinct()
     )
 
     return (
-        unichem_molecule_struct_spark_df
-
-            # Exploding the STRUCTURE_ID array into a column called PDB:
-            .select(
-                'name', 'CHEMBL_MOLECULE_ID', 'PDB_COMPOUND_ID',
-                f.explode(f.col('STRUCTURE_ID')).alias('PDB')
+        unichem_molecule_struct_df
+        # Exploding the STRUCTURE_ID array into a column called PDB:
+        .select(
+            'chemblId', 'name', 'linkedTargets', 'linkedDiseases', 'pdbCompoundId',
+            f.explode(f.col('pdbStructureId')).alias('pdbStructureId')
             )
-
-            # Joining chain ids by PDB identifier:
-            .join(pdb_chain_ensembl, on='PDB', how='inner')
-
-            # The dataframe is stored in memory when returning:
-            .persist()
+        # Joining chain ids by PDB identifier:
+        .join(pdb_chain_ensembl, on='pdbStructureId', how='inner')
+        # The dataframe is stored in memory when returning:
+        .persist()
     )
 
 
-# In[ ]:
-
-
-# TIMER 1 START
-start_1 = timeit.default_timer()
-
-
-# In[ ]:
-
-
-# ----- GET MOLECULE ID -----
-# Molecule DataFrame
-molecule_df = (
-    spark.read
-    .parquet(args.parquet)
-    .select(f.col('name').alias('NAME'), f.col('id').alias('CHEMBL_MOLECULE_ID'))
-)
-molecule_df.show()
-
-
-# In[ ]:
-
-
-# ----- GET PDB ID -----
-# Unichem molecules DataFrame
-unichem_df = (
-    spark.read.csv(args.unichem, sep=r'\t', header=True)
-    .withColumnRenamed('From src:\'1\'', 'CHEMBL_MOLECULE_ID')
-    .withColumnRenamed('To src:\'3\'', 'PDB_COMPOUND_ID')
-)
-
-# Join Unichem and Molecule DataFrame
-unichem_molecule_df = (molecule_df.alias("a")
-                       .join(unichem_df.alias("b"), unichem_df["CHEMBL_MOLECULE_ID"] == molecule_df['CHEMBL_MOLECULE_ID'])
-                       ).select("NAME", "a.CHEMBL_MOLECULE_ID", "PDB_COMPOUND_ID")
-
-unichem_molecule_df.show()
-
-
-# In[ ]:
-
-
-# TIMER 2 START
-start_2 = timeit.default_timer()
-
-
-# In[ ]:
-
-
-# ----- GET STRUCTURE ID -----
-# Apply get_structure function on the Unichem-Molecule DataFrame
-
-unichem_molecule_struct_pd_df = (unichem_molecule_df
-                                 .toPandas()
-                                 .assign(STRUCTURE_ID=lambda x: x['PDB_COMPOUND_ID'].apply(get_structure))
-                                 )
-
-
-# 
-
-# In[ ]:
-
-
-unichem_molecule_struct_pd_df.to_csv('structure_of_molecules.csv', index=False, header=True)
-
-
-# In[ ]:
-
-
-# Convert Spark DataFrame into Pandas DataFrame
-unichem_molecule_struct_spark_df = spark.createDataFrame(unichem_molecule_struct_pd_df)
-unichem_molecule_struct_spark_df.show()
-
-
-# In[ ]:
-
-
-# Count number of structure per molecule
-unichem_molecule_struct_spark_df = (unichem_molecule_struct_spark_df
-                                    .withColumn("NB_OF_STRUCT_PER_MOL", f.size(f.col("STRUCTURE_ID")))
-                                    .orderBy(f.desc("NB_OF_STRUCT_PER_MOL"))
-                                    )
-unichem_molecule_struct_spark_df.show()
-
-
-# In[ ]:
-
-
-unichem_molecule_struct_spark_df = (
-    unichem_molecule_struct_spark_df
-        .filter(~f.col('CHEMBL_MOLECULE_ID').isin(dropped_molecules))
-        .select('*')
-)
-unichem_molecule_struct_spark_df.show()
-
-
-# In[ ]:
-
-
-# Save into a CSV
-unichem_molecule_struct_spark_df.toPandas().to_csv("molecule_structure_target.csv", index=False, header=True)
-
-
-# In[ ]:
-
-
-# TIMER 2 STOP
-stop_2 = timeit.default_timer()
-
-
-# In[ ]:
-
-
-# ----- GET TARGET ID -----
-pdb_target_df = create_pdb_target_gene_df(args.ensembl, unichem_molecule_struct_spark_df)
-pdb_target_df.show()
-
-
-# In[ ]:
-
-
-# ----- STATISTICS -----
-total_nb_unichem = unichem_df.count()
-total_nb_molecule = molecule_df.count()
-nb_mol_in_unichem = unichem_molecule_df.count()
-
-
-# In[ ]:
-
-
-total_nb_struct = unichem_molecule_struct_spark_df.withColumn('STRUCTURE_ID', f.explode('STRUCTURE_ID')).select(
-    'STRUCTURE_ID').distinct().count()
-
-
-# In[ ]:
-
-
-nb_target_pd = pdb_target_df.count()
-nb_human_target = pdb_target_df.filter(pdb_target_df.GENE_ID.startswith('ENSG')).count()
-
-
-# In[ ]:
-
-
-nb_molecule_without_struct = unichem_molecule_struct_spark_df.filter(f.size('STRUCTURE_ID') == 0).count()
-
-
-# In[ ]:
-
-
-nb_non_human_target = nb_target_pd - nb_human_target
-
-
-# In[ ]:
-
-
-# TIMER 1 STOP
-stop_1 = timeit.default_timer()
-
-
-# In[ ]:
-
-
-statistics = [
-    ['Total molecules in UniChem database', total_nb_unichem],
-    ['Molecules in parquet', total_nb_molecule],
-    ['Molecules from parquet found in UniChem', nb_mol_in_unichem],
-    ['Percentage of parquet molecule found in UniChem', int(round((nb_mol_in_unichem / total_nb_molecule) * 100, 2))],
-    ['Total structures', total_nb_struct],
-    ['Molecules without structure', nb_molecule_without_struct],
-    ['Total targets', nb_target_pd],
-    ['Human target', nb_human_target],
-    ['None human target', nb_non_human_target],
-    ['Total time running', int(round(stop_1 - start_1, 2))],
-    ['Time for scrap structure on API', int(round(stop_2 - start_2, 2))]
-]
-
-columns = ["Stats", "Count"]
-
-
-# In[ ]:
-
-
-stats_df = spark.createDataFrame(statistics, columns)
-
-
-# In[ ]:
-
-
-print('----STATISTICS----')
-stats_df.show(truncate=False)
-
-# print('----MOLECULE----')
-# molecule_df.show()
-
-# print('----UNICHEM MOLECULE----')
-# unichem_df.show()
-
-# print('----OUR MOLECULE IN UNICHEM (PDB ID)----')
-# unichem_molecule_df.show()
-
-# print('----STRUCTURE----')
-# unichem_molecule_struct_spark_df.show()
-
-# print('----TARGET----')
-# pdb_target_df.show()
-
+if __name__ == '__main__':
+
+    global spark
+
+    program_description = '''
+    This script retrieves the structures corresponding to the complex between molecules from parquet files and targets.
+    How to find the files?
+    molecule file here (Drug): http://ftp.ebi.ac.uk/pub/databases/opentargets/platform/21.11/output/etl/parquet/molecule/*
+    inchikey file : https://ftp.ebi.ac.uk/pub/databases/msd/pdbechem_v2/components_inchikeys.csv
+    ensembl file : https://ftp.ebi.ac.uk/pub/databases/msd/sifts/csv/pdb_chain_ensembl.csv
+    '''
+
+    parser = argparse.ArgumentParser(add_help=True, description=program_description)
+
+    parser.add_argument('-p',
+                        '--parquet',
+                        help='Path to parquet folder',
+                        default=None,
+                        metavar='parquet_file_path',
+                        type=str,
+                        required=True)
+
+    parser.add_argument('-i',
+                        '--inchikey',
+                        help='Path to inchikey file',
+                        default=None,
+                        metavar='inchikey_file_path',
+                        type=str,
+                        required=True)
+
+    parser.add_argument('-e',
+                        '--ensembl',
+                        help='Path to pdb_chain_ensembl.csv file',
+                        default=None,
+                        metavar='ensembl_file_path',
+                        type=str,
+                        required=True)
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(module)s - %(funcName)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    logging.StreamHandler(sys.stderr)
+
+    logging.info(program_description)
+
+    main()
