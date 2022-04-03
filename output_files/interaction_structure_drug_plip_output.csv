@@ -1,0 +1,14 @@
+pdb_structure_id,compound_id,interaction_type,prot_residue_number,prot_residue_type,prot_chain_id
+5te8,08J,hydroph_interaction,216,LEU,A
+5te8,08J,hydroph_interaction,305,ALA,A
+5te8,08J,hydroph_interaction,482,LEU,A
+5te8,08J,hbond,119,SER,B
+5te8,08J,hydroph_interaction,216,LEU,B
+5te8,08J,hydroph_interaction,305,ALA,B
+5te8,08J,hydroph_interaction,370,ALA,B
+5te8,08J,hydroph_interaction,482,LEU,B
+5te8,08J,hydroph_interaction,216,LEU,C
+5te8,08J,hydroph_interaction,216,LEU,C
+5te8,08J,hydroph_interaction,305,ALA,C
+5te8,08J,hydroph_interaction,369,ILE,C
+5te8,08J,hydroph_interaction,482,LEU,C
