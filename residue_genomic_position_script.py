@@ -1,4 +1,5 @@
 import argparse
+from email import header
 from json import JSONDecodeError
 import logging
 import psutil
@@ -8,6 +9,7 @@ import requests
 from pandarallel import pandarallel
 import pyspark.sql.functions as f
 from pyspark.sql import SparkSession
+from pyspark.sql.types import StructField, StructType, IntegerType, StringType
 
 
 # Global configuration for Spark and Pandarallel.
@@ -114,25 +116,20 @@ def main():
     # Test set
     if args.test_set:
 
-        plip_output_agg = plip_output_agg.sample(0.1, 3)
+        plip_output_agg = plip_output_agg.sample(0.001, 3)
 
-        # plip_output_agg = (
-        #     plip_output_agg
-        #     .filter(plip_output_agg.pdbStructId.rlike('1dqa'))
-        # )
-
-    # Pandas Apply
+    # # Pandas Apply
     genomic_pos_pd = plip_output_agg.toPandas()
-    genomic_pos_pd["resNb, resType, chain, intType, chr, genPos"] = genomic_pos_pd.parallel_apply(
+    genomic_pos_pd["resInfos"] = genomic_pos_pd.parallel_apply(
         fetch_gapi_ensembl_mapping, axis=1
         )
 
     # Final DF
-    genomic_pos_rm_null_pd = genomic_pos_pd[["geneId", "pdbStructId", "resNb, resType, chain, intType, chr, genPos"]].dropna()
+    genomic_pos_rm_null_pd = genomic_pos_pd[["geneId", "pdbStructId", "resInfos"]].dropna()
 
-    final_df = genomic_pos_rm_null_pd.explode('resNb, resType, chain, intType, chr, genPos')
+    final_df = genomic_pos_rm_null_pd.explode('resInfos')
 
-    final_df.to_csv(args.output_folder + "/residue_genomic_position.csv", index=False, header=True)
+    final_df.to_json(args.output_folder + "/residue_genomic_position_2.json", orient="records")
 
 
 def fetch_gapi_ensembl_mapping(row):
@@ -194,10 +191,21 @@ def filter_dict_file(e_mapping_file, pdb_struct_id, gene_id, residue_info):
                 res_pos_2 = res_pos_1 + 1
                 res_pos_3 = res_pos_1 + 2
 
-                new_elem = [res_nb, res_type, chain, inter_type, chromosome, [res_pos_1, res_pos_2, res_pos_3]]
+                new_elem = {
+                    "res_nb": res_nb, 
+                    "res_type": res_type, 
+                    "chain": chain, 
+                    "inter_type": inter_type, 
+                    "chromosome": chromosome, 
+                    "genLocation": {
+                        "res_pos_1": res_pos_1, 
+                        "res_pos_2": res_pos_2, 
+                        "res_pos_3": res_pos_3
+                        }
+                        }
 
                 if new_elem not in output_list:
-                    output_list.append([res_nb, res_type, chain, inter_type, chromosome, [res_pos_1, res_pos_2, res_pos_3]])
+                    output_list.append(new_elem)
 
     return output_list
 
