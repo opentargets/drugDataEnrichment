@@ -1,0 +1,10 @@
+INFO:root:
+    Compute PLIP interactions between PDB structures and compounds (Drugs).
+    
+INFO:root:Program begin.
+INFO:root:Loading input.
+INFO:root:
+    Compute PLIP interactions between PDB structures and compounds (Drugs).
+    
+INFO:root:Program begin.
+INFO:root:Loading input.
