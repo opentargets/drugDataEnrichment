@@ -62,14 +62,17 @@ def main():
             f.col('geneId'),
             f.col("pdbStructureId").alias("pdbStructId")
         ])
-        .agg(f.collect_set(f.struct(
-                f.col('pdbCompoundId'),
-                f.col('chromosome'),
-                f.col('intType'),
-                f.col('chainId'),
-                f.col('protResType'),
-                f.col('protResNb')))        
-            .alias("chr, intType, chain, resType, resNb"),
+        .agg(
+            f.collect_set(
+                f.struct(
+                    f.col('pdbCompoundId'),
+                    f.col('chromosome'),
+                    f.col('intType'),
+                    f.col('chainId'),
+                    f.col('protResType'),
+                    f.col('protResNb')
+                    )
+                ).alias("chr, intType, chain, resType, resNb"),
             f.collect_set(f.col("pdbCompoundId")).alias("pdbCompId")
         )
     )
@@ -155,14 +158,14 @@ def filter_dict_file(e_mapping_file, pdb_struct_id, gene_id, residue_info):
 
                 new_elem = {
                     "compound": compound,
-                    "res_nb": res_nb, 
-                    "res_type": res_type, 
-                    "chain": chain, 
-                    "inter_type": inter_type, 
-                    "chromosome": chromosome, 
+                    "res_nb": res_nb,
+                    "res_type": res_type,
+                    "chain": chain,
+                    "inter_type": inter_type,
+                    "chromosome": chromosome,
                     "genLocation": {
-                        "res_pos_1": res_pos_1, 
-                        "res_pos_2": res_pos_2, 
+                        "res_pos_1": res_pos_1,
+                        "res_pos_2": res_pos_2,
                         "res_pos_3": res_pos_3
                     }
                 }
